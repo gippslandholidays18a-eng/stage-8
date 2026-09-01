@@ -111,6 +111,11 @@ import review_service
 import staff_service
 import hours_service
 import announcements_service
+import roommaster_service
+import inbox_service
+import paddle_service
+import pricing_service
+import notifications_service
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -3281,7 +3286,6 @@ async def _ensure_team_token() -> str:
 
 @api.get("/staff/team/ical")
 async def staff_team_ical(token: str):
-    from fastapi.responses import Response
     stored = await _ensure_team_token()
     if token != stored:
         raise HTTPException(status_code=403, detail="Invalid token")
@@ -3300,7 +3304,6 @@ async def staff_team_ical_info():
 
 @api.get("/staff/{staff_id}/ical")
 async def staff_ical(staff_id: str, token: str):
-    from fastapi.responses import Response
     u = await db.users.find_one({"id": staff_id}, {"_id": 0, "id": 1, "name": 1, "ical_token": 1})
     if not u or u.get("ical_token") != token:
         raise HTTPException(status_code=403, detail="Invalid token")
@@ -3528,6 +3531,498 @@ async def announcements_delete(aid: str):
     if r.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
     return {"deleted": True}
+
+
+# =============================================================================
+# Stage 8 — RoomMaster webhook + Inbox + Command Centre + Paddle + Pricing +
+#           Notifications
+# =============================================================================
+
+from fastapi import Header, Request
+from fastapi.responses import Response
+
+
+# --- 1. RoomMaster webhook ---------------------------------------------------
+
+@app.post("/api/roommaster/webhook")
+async def roommaster_webhook(
+    request: Request,
+    x_roommaster_api_key: Optional[str] = Header(default=None, alias="X-RoomMaster-API-Key"),
+):
+    """Inbound webhook from RoomMaster PMS. Auth via X-RoomMaster-API-Key header."""
+    expected = os.environ.get("ROOMMASTER_WEBHOOK_SECRET")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+    if not x_roommaster_api_key or x_roommaster_api_key != expected:
+        logger.warning("RoomMaster webhook rejected — bad or missing API key")
+        raise HTTPException(status_code=401, detail="Invalid or missing X-RoomMaster-API-Key")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+
+    result = await roommaster_service.process_webhook(db, payload)
+    logger.info(
+        "RoomMaster webhook %s — event=%s rid=%s reason=%s",
+        result.get("status"),
+        payload.get("event_type") if isinstance(payload, dict) else "?",
+        result.get("reservation_id"),
+        result.get("reason"),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@api.get("/roommaster/logs", dependencies=AUTH_MGR)
+async def roommaster_logs(limit: int = 50):
+    cursor = db.roommaster_webhook_logs.find({}, {"_id": 0}).sort("received_at", -1).limit(limit)
+    return {"items": await cursor.to_list(length=limit)}
+
+
+# --- 2. Guest inbox ----------------------------------------------------------
+
+class InboxCreate(BaseModel):
+    source: str = "email"
+    from_guest_email: str
+    from_guest_name: str = ""
+    subject: str = ""
+    body: str = ""
+    property_id: Optional[str] = None
+    property_name: Optional[str] = None
+    related_reservation_id: Optional[str] = None
+    sentiment: str = "neutral"
+    urgent: bool = False
+
+
+class InboxSendReply(BaseModel):
+    reply_body: str
+
+
+@api.get("/inbox", dependencies=AUTH_MGR)
+async def inbox_list(
+    status: Optional[str] = None,
+    sentiment: Optional[str] = None,
+    property_id: Optional[str] = None,
+    days: Optional[int] = None,
+    q: Optional[str] = None,
+):
+    items = await inbox_service.list_inbox(
+        db, status=status, sentiment=sentiment, property_id=property_id, days=days, q=q,
+    )
+    return {"items": [inbox_service.summarize_thread(m) for m in items]}
+
+
+@api.get("/inbox/counts", dependencies=AUTH_MGR)
+async def inbox_counts():
+    unread = await db.inbox_messages.count_documents(
+        {"direction": "inbound", "archived": {"$ne": True}, "read": False},
+    )
+    urgent = await db.inbox_messages.count_documents(
+        {"direction": "inbound", "archived": {"$ne": True}, "urgent": True, "status": {"$ne": "Replied"}},
+    )
+    return {"unread": unread, "urgent": urgent}
+
+
+@api.post("/inbox", dependencies=AUTH_MGR)
+async def inbox_create(payload: InboxCreate):
+    msg = inbox_service.build_message(**payload.model_dump())
+    if payload.property_id and not msg.get("property_name"):
+        prop = await db.properties.find_one({"id": payload.property_id}, {"_id": 0, "name": 1})
+        if prop:
+            msg["property_name"] = prop.get("name")
+    await db.inbox_messages.insert_one(msg.copy())
+    try:
+        await notifications_service.emit_inbox_notification(db, msg)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("notification emit failed: %s", e)
+    msg.pop("_id", None)
+    return msg
+
+
+@api.get("/inbox/{message_id}", dependencies=AUTH_MGR)
+async def inbox_get(message_id: str):
+    msg = await db.inbox_messages.find_one(
+        {"$or": [{"id": message_id}, {"message_id": message_id}]}, {"_id": 0},
+    )
+    if not msg:
+        raise HTTPException(status_code=404, detail="Not found")
+    thread = await inbox_service.get_thread(db, msg.get("thread_id"))
+    return {"message": msg, "thread": thread}
+
+
+@api.post("/inbox/{message_id}/read", dependencies=AUTH_MGR)
+async def inbox_mark_read(message_id: str, read: bool = True):
+    m = await inbox_service.mark_read(db, message_id, read)
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    return m
+
+
+@api.post("/inbox/{message_id}/archive", dependencies=AUTH_MGR)
+async def inbox_archive(message_id: str, archived: bool = True):
+    m = await inbox_service.archive_message(db, message_id, archived)
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    return m
+
+
+@api.post("/inbox/{message_id}/draft-reply", dependencies=AUTH_MGR)
+async def inbox_draft_reply(message_id: str):
+    """AI drafting deferred — returns a helpful placeholder marker."""
+    m = await inbox_service.draft_reply_stub(db, message_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "message": m,
+        "ai_available": False,
+        "note": inbox_service.AI_COMING_SOON_MARKER,
+    }
+
+
+@api.post("/inbox/{message_id}/send-reply", dependencies=AUTH_MGR)
+async def inbox_send_reply(message_id: str, payload: InboxSendReply,
+                           actor: Dict[str, Any] = Depends(current_user_dep)):
+    result = await inbox_service.send_reply(
+        db, message_id, payload.reply_body,
+        reply_from={"id": actor.get("id"), "name": actor.get("name")},
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Send failed")
+    return result
+
+
+# --- 3. Command centre -------------------------------------------------------
+
+@api.get("/command-centre", dependencies=AUTH_MGR)
+async def command_centre():
+    """Aggregate the 6 daily streams in one call so the dashboard can auto-refresh cheaply."""
+    today = datetime.now(timezone.utc).date()
+    today_iso = today.isoformat()
+    horizon = (today + timedelta(days=6)).isoformat()
+
+    # Stream 1: check-ins & check-outs, next 7 days
+    reservations_7d = await db.reservations.find(
+        {"$or": [
+            {"checkin_date": {"$gte": today_iso, "$lte": horizon}},
+            {"checkout_date": {"$gte": today_iso, "$lte": horizon}},
+            {"check_in_date": {"$gte": today_iso, "$lte": horizon}},
+            {"check_out_date": {"$gte": today_iso, "$lte": horizon}},
+        ], "is_cancelled": {"$ne": True}},
+        {"_id": 0},
+    ).to_list(length=2000)
+
+    days_out: List[Dict[str, Any]] = []
+    for i in range(7):
+        d = (today + timedelta(days=i)).isoformat()
+        ci_props: Dict[str, int] = {}
+        co_props: Dict[str, int] = {}
+        for r in reservations_7d:
+            ci = r.get("checkin_date") or r.get("check_in_date")
+            co = r.get("checkout_date") or r.get("check_out_date")
+            name = r.get("property_name") or "—"
+            if ci == d:
+                ci_props[name] = ci_props.get(name, 0) + 1
+            if co == d:
+                co_props[name] = co_props.get(name, 0) + 1
+        days_out.append({
+            "date": d,
+            "check_ins": sum(ci_props.values()),
+            "check_outs": sum(co_props.values()),
+            "check_in_by_property": ci_props,
+            "check_out_by_property": co_props,
+        })
+
+    # Stream 2: overdue / due-today tasks
+    tasks_stream = await db.tasks.find(
+        {"due_date": {"$lte": today_iso},
+         "status": {"$nin": ["completed", "cancelled", "archived"]}},
+        {"_id": 0},
+    ).sort("due_date", 1).limit(30).to_list(length=30)
+
+    # Stream 4: guest follow-ups (Replied but > 48h since last update)
+    followup_cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    guest_followups = await db.inbox_messages.find(
+        {"direction": "inbound", "status": "Replied",
+         "updated_at": {"$lt": followup_cutoff}, "archived": {"$ne": True}},
+        {"_id": 0},
+    ).sort("updated_at", -1).limit(20).to_list(length=20)
+
+    # Stream 5: unread messages
+    unread_messages = await db.inbox_messages.find(
+        {"direction": "inbound", "read": False, "archived": {"$ne": True}},
+        {"_id": 0},
+    ).sort("received_at", -1).limit(20).to_list(length=20)
+    for m in unread_messages:
+        body = m.get("body") or ""
+        m["preview"] = body[:100] + ("…" if len(body) > 100 else "")
+
+    # Stream 6: paddle bookings today
+    paddle_today = await db.paddle_bookings.find(
+        {"booking_date": today_iso}, {"_id": 0},
+    ).sort("booking_time", 1).to_list(length=100)
+
+    return {
+        "today": today_iso,
+        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+        "week": days_out,
+        "tasks": tasks_stream,
+        "guest_followups": guest_followups,
+        "unread_messages": unread_messages,
+        "paddle_today": paddle_today,
+        "payment_followups_note": "Payment follow-ups tracking arrives in Stage 9.",
+    }
+
+
+# --- 4. Paddle & Pedal Paynesville -------------------------------------------
+
+class PaddleCreate(BaseModel):
+    guest_name: str
+    guest_email: Optional[str] = ""
+    guest_id: Optional[str] = None
+    property_id: Optional[str] = None
+    property_name: Optional[str] = None
+    activity_type: str = "Paddle"
+    booking_date: str
+    booking_time: str = "09:00"
+    duration_hours: float = 1.0
+    total_price: float = 0.0
+    notes: str = ""
+    status: str = "confirmed"
+
+
+class PaddleUpdate(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    booking_date: Optional[str] = None
+    booking_time: Optional[str] = None
+    duration_hours: Optional[float] = None
+    total_price: Optional[float] = None
+
+
+@api.get("/paddle", dependencies=AUTH_MGR)
+async def paddle_list(on_date: Optional[str] = Query(default=None, alias="date"),
+                      start: Optional[str] = None, end: Optional[str] = None,
+                      activity_type: Optional[str] = None,
+                      status: Optional[str] = None):
+    q: Dict[str, Any] = {}
+    if on_date:
+        q["booking_date"] = on_date
+    elif start or end:
+        q["booking_date"] = {}
+        if start:
+            q["booking_date"]["$gte"] = start
+        if end:
+            q["booking_date"]["$lte"] = end
+    if activity_type and activity_type != "all":
+        q["activity_type"] = activity_type
+    if status and status != "all":
+        q["status"] = status
+    cursor = db.paddle_bookings.find(q, {"_id": 0}).sort([("booking_date", -1), ("booking_time", 1)])
+    return {"items": await cursor.to_list(length=500)}
+
+
+@api.post("/paddle", dependencies=AUTH_MGR)
+async def paddle_create(payload: PaddleCreate):
+    if payload.property_id and not payload.property_name:
+        prop = await db.properties.find_one({"id": payload.property_id}, {"_id": 0, "name": 1})
+        if prop:
+            payload.property_name = prop.get("name")
+    doc = paddle_service.build_booking(**payload.model_dump())
+    await db.paddle_bookings.insert_one(doc.copy())
+    doc.pop("_id", None)
+    return doc
+
+
+@api.put("/paddle/{booking_id}", dependencies=AUTH_MGR)
+async def paddle_update(booking_id: str, payload: PaddleUpdate):
+    patch = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    patch["updated_at"] = paddle_service.now_iso()
+    r = await db.paddle_bookings.find_one_and_update(
+        {"$or": [{"id": booking_id}, {"booking_id": booking_id}]},
+        {"$set": patch}, projection={"_id": 0}, return_document=True,
+    )
+    if not r:
+        raise HTTPException(status_code=404, detail="Not found")
+    return r
+
+
+@api.delete("/paddle/{booking_id}", dependencies=AUTH_MGR)
+async def paddle_delete(booking_id: str):
+    r = await db.paddle_bookings.delete_one(
+        {"$or": [{"id": booking_id}, {"booking_id": booking_id}]},
+    )
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"deleted": True}
+
+
+# --- 5. Seasonal pricing engine ----------------------------------------------
+
+class PricingCellUpdate(BaseModel):
+    base_nightly_rate: Optional[float] = None
+    multiplier: Optional[float] = None
+    season: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class PricingBulkImport(BaseModel):
+    csv_text: str
+
+
+@api.get("/pricing", dependencies=AUTH_MGR)
+async def pricing_list(property_id: Optional[str] = None,
+                       date_from: str = None, date_to: str = None):
+    if not (date_from and date_to):
+        today = datetime.now(timezone.utc).date()
+        date_from = today.isoformat()
+        date_to = (today + timedelta(days=90)).isoformat()
+    items = await pricing_service.list_range(db, property_id, date_from, date_to)
+    return {"items": items, "date_from": date_from, "date_to": date_to}
+
+
+@api.put("/pricing/{property_id}/{d}", dependencies=AUTH_MGR)
+async def pricing_upsert(property_id: str, d: str, payload: PricingCellUpdate):
+    prop = await db.properties.find_one({"id": property_id}, {"_id": 0, "id": 1})
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    doc = await pricing_service.upsert_cell(
+        db, property_id, d, {k: v for k, v in payload.model_dump().items() if v is not None},
+    )
+    doc.pop("_id", None)
+    return doc
+
+
+@api.post("/pricing/bulk-import", dependencies=AUTH_MGR)
+async def pricing_bulk_import(payload: PricingBulkImport):
+    rows, errors = pricing_service.parse_csv_import(payload.csv_text)
+    prop_by_name: Dict[str, str] = {}
+    async for p in db.properties.find({}, {"_id": 0, "id": 1, "name": 1}):
+        prop_by_name[p["name"].lower()] = p["id"]
+
+    written = 0
+    skipped: List[str] = []
+    for r in rows:
+        pid = r.get("property_id")
+        if not pid and r.get("property_name"):
+            pid = prop_by_name.get(str(r["property_name"]).lower())
+        if not pid:
+            skipped.append(f"Row for {r.get('date')}: no property match")
+            continue
+        await pricing_service.upsert_cell(db, pid, r["date"], {
+            "base_nightly_rate": r["base_nightly_rate"],
+            "multiplier": r["multiplier"],
+            "season": r["season"],
+            "notes": r["notes"],
+        })
+        written += 1
+    return {"written": written, "errors": errors + skipped, "total_rows": len(rows)}
+
+
+@api.get("/pricing/export.csv", response_class=PlainTextResponse, dependencies=AUTH_MGR)
+async def pricing_export(property_id: Optional[str] = None,
+                         date_from: Optional[str] = None, date_to: Optional[str] = None):
+    if not (date_from and date_to):
+        today = datetime.now(timezone.utc).date()
+        date_from = today.isoformat()
+        date_to = (today + timedelta(days=90)).isoformat()
+    items = await pricing_service.list_range(db, property_id, date_from, date_to)
+    return pricing_service.render_export_csv(items)
+
+
+@api.get("/pricing/calc", dependencies=AUTH_MGR)
+async def pricing_calc(property_id: str, check_in: str, check_out: str):
+    return await pricing_service.calculate_nightly_rate(db, property_id, check_in, check_out)
+
+
+# --- 6. Notifications --------------------------------------------------------
+
+@api.get("/notifications", dependencies=AUTH_ANY)
+async def notifications_list(only_unread: bool = False, limit: int = 20):
+    items = await notifications_service.list_recent(db, only_unread=only_unread, limit=limit)
+    unread = await notifications_service.unread_count(db)
+    return {"items": items, "unread_count": unread}
+
+
+@api.put("/notifications/{nid}/read", dependencies=AUTH_ANY)
+async def notifications_mark_read(nid: str):
+    r = await notifications_service.mark_read(db, nid)
+    if not r:
+        raise HTTPException(status_code=404, detail="Not found")
+    return r
+
+
+@api.put("/notifications/read-all", dependencies=AUTH_ANY)
+async def notifications_mark_all_read():
+    n = await notifications_service.mark_all_read(db)
+    return {"modified": n}
+
+
+# --- APScheduler jobs --------------------------------------------------------
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+_scheduler: Optional[AsyncIOScheduler] = None
+
+
+def _init_scheduler():
+    global _scheduler
+    if _scheduler is not None:
+        return
+    sched = AsyncIOScheduler(timezone="Australia/Melbourne")
+
+    async def _overdue_job():
+        try:
+            await notifications_service.check_overdue_tasks(db)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("overdue task job failed: %s", e)
+
+    async def _turnover_job():
+        try:
+            await notifications_service.check_turnovers(db)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("turnover job failed: %s", e)
+
+    async def _cleanup_job():
+        try:
+            await notifications_service.cleanup_expired(db)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("cleanup job failed: %s", e)
+
+    sched.add_job(_overdue_job, CronTrigger(hour=8, minute=0), id="overdue_tasks",
+                  replace_existing=True)
+    sched.add_job(_turnover_job, CronTrigger(hour=8, minute=0), id="turnovers",
+                  replace_existing=True)
+    sched.add_job(_cleanup_job, CronTrigger(hour=2, minute=0), id="cleanup_notifications",
+                  replace_existing=True)
+    sched.start()
+    _scheduler = sched
+    logger.info("Stage 8 APScheduler started (overdue+turnover 08:00, cleanup 02:00 Australia/Melbourne)")
+
+
+@app.on_event("startup")
+async def stage8_startup():
+    try:
+        await db.roommaster_webhook_logs.create_index([("received_at", -1)])
+        await db.inbox_messages.create_index([("received_at", -1)])
+        await db.inbox_messages.create_index("thread_id")
+        await db.inbox_messages.create_index("from_guest_email")
+        await db.inbox_messages.create_index([("direction", 1), ("read", 1), ("archived", 1)])
+        await db.paddle_bookings.create_index([("booking_date", -1)])
+        await db.pricing_calendar.create_index([("property_id", 1), ("date", 1)], unique=True)
+        await db.notifications.create_index([("created_at", -1)])
+        await db.notifications.create_index("expires_at")
+        _init_scheduler()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("stage 8 startup failed: %s", e)
+
+
+# =============================================================================
+# End Stage 8
+# =============================================================================
 
 
 # Mount the API router at the very end so all endpoints (incl. Stage 6A auth) are registered

@@ -26,6 +26,10 @@ import Reviews from "@/pages/Reviews";
 import StaffCalendar from "@/pages/StaffCalendar";
 import StaffHours from "@/pages/StaffHours";
 import StaffProfile from "@/pages/StaffProfile";
+import Inbox from "@/pages/Inbox";
+import CommandCentre from "@/pages/CommandCentre";
+import Paddle from "@/pages/Paddle";
+import Pricing from "@/pages/Pricing";
 
 function App() {
   return (
@@ -57,6 +61,14 @@ function App() {
                 <Route path="staff/calendar" element={<StaffCalendar />} />
                 <Route path="staff/hours" element={<StaffHours />} />
                 <Route path="staff/:id" element={<StaffProfile />} />
+
+                {/* Stage 8 — manager+ only */}
+                <Route element={<ProtectedRoute roles={["admin", "manager"]} />}>
+                  <Route path="inbox" element={<Inbox />} />
+                  <Route path="dashboard/command-centre" element={<CommandCentre />} />
+                  <Route path="paddle" element={<Paddle />} />
+                  <Route path="pricing" element={<Pricing />} />
+                </Route>
 
                 {/* Admin-only nested routes */}
                 <Route element={<ProtectedRoute roles={["admin"]} />}>

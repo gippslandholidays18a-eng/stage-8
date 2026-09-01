@@ -2,19 +2,25 @@ import { NavLink, Outlet, useNavigate, Link } from "react-router-dom";
 import {
   LayoutDashboard, Upload, Table2, Building2, History, Users, AlertTriangle,
   Sparkles, Settings, FileDown, Mail, Megaphone, Tag, Shield, LogOut, CheckSquare, ShieldCheck, Boxes, Star, CalendarDays, Clock3,
+  Inbox as InboxIcon, Radar, Waves, DollarSign,
 } from "lucide-react";
 import { Toaster } from "sonner";
 import { useAuth, hasRole } from "@/context/AuthContext";
+import NotificationBell from "@/components/NotificationBell";
 
 // Each item declares which roles may see it. `staffLabel` overrides `label` for staff role.
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard", end: true, roles: ["admin", "manager"] },
+  { to: "/dashboard/command-centre", label: "Command centre", icon: Radar, testid: "nav-command-centre", roles: ["admin", "manager"] },
+  { to: "/inbox", label: "Inbox", icon: InboxIcon, testid: "nav-inbox", roles: ["admin", "manager"] },
   { to: "/tasks", label: "Tasks", icon: CheckSquare, testid: "nav-tasks", roles: ["admin", "manager", "staff"] },
   { to: "/staff/calendar", label: "Staff calendar", staffLabel: "My calendar", icon: CalendarDays, testid: "nav-staff-calendar", roles: ["admin", "manager", "staff"] },
   { to: "/staff/hours", label: "Staff hours", staffLabel: "My hours", icon: Clock3, testid: "nav-staff-hours", roles: ["admin", "manager", "staff"] },
   { to: "/compliance", label: "Compliance", icon: ShieldCheck, testid: "nav-compliance", roles: ["admin", "manager"] },
   { to: "/inventory", label: "Inventory", icon: Boxes, testid: "nav-inventory", roles: ["admin", "manager", "staff"] },
   { to: "/reviews", label: "Reviews", icon: Star, testid: "nav-reviews", roles: ["admin", "manager"] },
+  { to: "/paddle", label: "Paddle & Pedal", icon: Waves, testid: "nav-paddle", roles: ["admin", "manager"] },
+  { to: "/pricing", label: "Pricing", icon: DollarSign, testid: "nav-pricing", roles: ["admin", "manager"] },
   { to: "/reservations", label: "Reservations", icon: Table2, testid: "nav-reservations", roles: ["admin", "manager"] },
   { to: "/segments", label: "Segments", icon: Users, testid: "nav-segments", roles: ["admin", "manager"] },
   { to: "/scores", label: "Scores", icon: Sparkles, testid: "nav-scores", roles: ["admin", "manager"] },
@@ -115,6 +121,10 @@ export default function Layout() {
           {/* Profile / logout */}
           {user && (
             <div className="px-3 py-3 border-t divider space-y-2" data-testid="sidebar-profile">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] uppercase tracking-[0.18em] text-dim">You</span>
+                <NotificationBell />
+              </div>
               <Link
                 to={`/staff/${user.id}`}
                 data-testid="profile-link"
@@ -150,13 +160,16 @@ export default function Layout() {
                 <span className="font-display text-sm">Sourcebench</span>
               </div>
               {user && (
-                <button
-                  onClick={handleLogout}
-                  data-testid="m-logout-button"
-                  className="text-[11px] text-dim hover:text-white inline-flex items-center gap-1"
-                >
-                  <LogOut className="w-3.5 h-3.5" /> Sign out
-                </button>
+                <div className="flex items-center gap-2">
+                  <NotificationBell />
+                  <button
+                    onClick={handleLogout}
+                    data-testid="m-logout-button"
+                    className="text-[11px] text-dim hover:text-white inline-flex items-center gap-1"
+                  >
+                    <LogOut className="w-3.5 h-3.5" /> Sign out
+                  </button>
+                </div>
               )}
             </div>
             <div className="flex gap-1 mt-3 overflow-x-auto -mx-1 px-1">
